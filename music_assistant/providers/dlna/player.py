@@ -410,7 +410,27 @@ class DLNAPlayer(Player):
         values: dict[str, ConfigValueType] | None = None,
     ) -> list[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the given player (if any)."""
-        return [*PLAYER_CONFIG_ENTRIES]
+        entries = [*PLAYER_CONFIG_ENTRIES]
+        
+        # Check supported audio codecs via UPnP SinkProtocolInfo
+        if self.device:
+            sink_protocols = [p.lower() for p in self.device.sink_protocol_info]
+            
+            # Music Assistant prefers FLAC by default.
+            supports_flac = any("audio/flac" in p or "audio/x-flac" in p for p in sink_protocols)
+            if not supports_flac:
+                from music_assistant.constants import create_output_codec_config_entry
+                
+                # If FLAC is unsupported, fallback to WAV or MP3
+                supports_wav = any("audio/wav" in p or "audio/x-wav" in p or "audio/l16" in p for p in sink_protocols)
+                
+                if supports_wav:
+                    entries.append(create_output_codec_config_entry(default_value="wav"))
+                else:
+                    # Final fallback if even WAV isn't supported
+                    entries.append(create_output_codec_config_entry(default_value="mp3"))
+
+        return entries
 
     # COMMANDS
     @catch_request_errors
