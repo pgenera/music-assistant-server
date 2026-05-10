@@ -2,10 +2,11 @@
 
 import pathlib
 import shutil
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import mutagen
 import pytest
+from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.constants import UNKNOWN_ARTIST
 from music_assistant.helpers import tags
@@ -184,86 +185,37 @@ async def test_parse_metadata_from_invalid_filename() -> None:
     assert _tags.musicbrainz_recordingid is None
 
 
-def test_split_artists_with_expected_count() -> None:
-    """Test splitting artists guided by expected count (from MB IDs)."""
-    # With expected_count=3, should split on extra splitters to reach target
-    result = split_artists("Shabson, Krgovich & Harris", expected_count=3)
-    assert result == ("Shabson", "Krgovich", "Harris")
-
-    # With expected_count=3, ampersands should split
-    result = split_artists("Shabson & Krgovich & Harris", expected_count=3)
-    assert result == ("Shabson", "Krgovich", "Harris")
-
-    # With expected_count=3, commas should split
-    result = split_artists("Shabson, Krgovich, Harris", expected_count=3)
-    assert result == ("Shabson", "Krgovich", "Harris")
-
-    # With expected_count=1, should NOT split at all
-    result = split_artists("Shabson & Krgovich", expected_count=1)
-    assert result == ("Shabson & Krgovich",)
-
-    # With expected_count=None (no MB IDs), should NOT split on extra splitters
-    result = split_artists("Shabson & Krgovich", expected_count=None)
-    assert result == ("Shabson & Krgovich",)
-
-    # With expected_count=0 (no MB IDs), should NOT split on extra splitters
-    result = split_artists("Shabson & Krgovich", expected_count=0)
-    assert result == ("Shabson & Krgovich",)
+def test_split_artists_semicolon() -> None:
+    """Test that split_artists splits on the semicolon delimiter."""
+    assert split_artists("Artist A;Artist B") == ("Artist A", "Artist B")
+    assert split_artists("Artist A; Artist B; Artist C") == ("Artist A", "Artist B", "Artist C")
+    # No semicolon, no split
+    assert split_artists("Single Artist") == ("Single Artist",)
 
 
 def test_split_artists_featuring() -> None:
-    """Test that featuring splitters always work regardless of expected_count."""
-    # "feat." should always split, even with no expected_count
-    result = split_artists("John Lennon feat. Yoko Ono", expected_count=None)
-    assert result == ("John Lennon", "Yoko Ono")
-
-    # "feat." should split even with expected_count=1 (featuring overrides)
-    # Actually, expected_count=1 means single artist, so we return as-is
-    result = split_artists("John Lennon feat. Yoko Ono", expected_count=1)
-    assert result == ("John Lennon feat. Yoko Ono",)
-
-    # "featuring" should work
-    result = split_artists("Artist A featuring Artist B", expected_count=None)
-    assert result == ("Artist A", "Artist B")
-
-    # "ft." should work
-    result = split_artists("Artist A ft. Artist B", expected_count=None)
-    assert result == ("Artist A", "Artist B")
+    """Test that split_artists always splits on featuring patterns."""
+    assert split_artists("John Lennon feat. Yoko Ono") == ("John Lennon", "Yoko Ono")
+    assert split_artists("Artist A featuring Artist B") == ("Artist A", "Artist B")
+    assert split_artists("Artist A ft. Artist B") == ("Artist A", "Artist B")
+    assert split_artists("Artist A vs. Artist B") == ("Artist A", "Artist B")
+    # Combined semicolon and featuring
+    assert split_artists("Drake;Eminem feat. Rihanna") == ("Drake", "Eminem", "Rihanna")
 
 
-def test_split_artists_no_oversplit() -> None:
-    """Test that split_artists stops at expected_count and doesn't over-split."""
-    # Hall & Oates is a duo, with 2 MB IDs we should split on feat. first
-    # and get exactly 2 artists
-    result = split_artists("Hall & Oates feat. David Ruffin", expected_count=2)
-    assert result == ("Hall & Oates", "David Ruffin")
+def test_split_artists_no_unsafe_splitters() -> None:
+    """Test that split_artists does NOT split on '&', ',', '+', or 'with'.
 
-    # With 3 MB IDs, we should split further
-    result = split_artists("Hall & Oates feat. David Ruffin", expected_count=3)
-    assert result == ("Hall", "Oates", "David Ruffin")
-
-    # Simon & Garfunkel with 1 MB ID (the duo) should stay as one
-    result = split_artists("Simon & Garfunkel", expected_count=1)
-    assert result == ("Simon & Garfunkel",)
-
-    # Simon & Garfunkel with 2 MB IDs (Paul + Art) should split
-    result = split_artists("Simon & Garfunkel", expected_count=2)
-    assert result == ("Simon", "Garfunkel")
-
-
-def test_split_artists_with_not_split() -> None:
-    """Test that 'with' is only split when we have MB ID evidence."""
-    # "with" should NOT split without expected_count (could be artist name)
-    result = split_artists("Jerk With a Bomb", expected_count=None)
-    assert result == ("Jerk With a Bomb",)
-
-    # "with" should NOT split with expected_count=1
-    result = split_artists("Jerk With a Bomb", expected_count=1)
-    assert result == ("Jerk With a Bomb",)
-
-    # "with" SHOULD split when expected_count=2 indicates multiple artists
-    result = split_artists("Artist A with Artist B", expected_count=2)
-    assert result == ("Artist A", "Artist B")
+    These are too ambiguous (e.g. "Hall & Oates", "Simon & Garfunkel",
+    "Jerk With a Bomb") and would over-split real artist names. When the
+    user wants disambiguation they should provide MusicBrainz Artist IDs
+    or use the format-native multi-value tag (multiple ARTIST fields,
+    null-separated TPE1, ARTISTS plural).
+    """
+    assert split_artists("Hall & Oates") == ("Hall & Oates",)
+    assert split_artists("Simon & Garfunkel") == ("Simon & Garfunkel",)
+    assert split_artists("Jerk With a Bomb") == ("Jerk With a Bomb",)
+    assert split_artists("Shabson, Krgovich & Harris") == ("Shabson, Krgovich & Harris",)
 
 
 def _create_mock_vorbis_tags(tag_dict: dict[str, list[str]]) -> MagicMock:
@@ -323,7 +275,7 @@ def test_parse_vorbis_tags_multiple_albumartist_fields() -> None:
 
     result = _parse_vorbis_tags(mock_tags)
 
-    # Multiple ALBUMARTIST fields should be stored as "albumartists" (plural)
+    # Multiple ALBUMARTIST fields populate the "albumartists" multi-value bucket
     assert result.get("albumartists") == ["Album Artist 1", "Album Artist 2"]
     assert "albumartist" not in result
 
@@ -342,23 +294,36 @@ def test_parse_vorbis_tags_single_albumartist_field() -> None:
     assert "albumartists" not in result
 
 
-def test_parse_vorbis_tags_explicit_artists_tag_takes_precedence() -> None:
-    """Test that explicit ARTISTS tag takes precedence over multiple ARTIST fields."""
+def test_parse_vorbis_tags_multiple_artist_fields_take_precedence() -> None:
+    """Multiple ARTIST fields (Vorbis-spec way) take precedence over the plural ARTISTS tag.
+
+    Tests that when both multiple ARTIST and plural ARTISTS are present, the
+    format-native multi-value path wins.
+    """
     mock_tags = _create_mock_vorbis_tags(
         {
-            "ARTIST": ["Artist A", "Artist B"],  # Multiple ARTIST fields
-            "ARTISTS": [
-                "Explicit Artist 1",
-                "Explicit Artist 2",
-                "Explicit Artist 3",
-            ],  # Explicit tag
+            "ARTIST": ["Artist A", "Artist B"],
+            "ARTISTS": ["Should Not Win 1", "Should Not Win 2", "Should Not Win 3"],
         }
     )
 
     result = _parse_vorbis_tags(mock_tags)
 
-    # ARTISTS tag should take precedence
-    assert result.get("artists") == ["Explicit Artist 1", "Explicit Artist 2", "Explicit Artist 3"]
+    assert result.get("artists") == ["Artist A", "Artist B"]
+
+
+def test_parse_vorbis_tags_plural_artists_tag_used_as_fallback() -> None:
+    """Test that the plural ARTISTS tag is used when only a single ARTIST field exists."""
+    mock_tags = _create_mock_vorbis_tags(
+        {
+            "ARTIST": ["Single Artist"],
+            "ARTISTS": ["Plural Artist 1", "Plural Artist 2"],
+        }
+    )
+
+    result = _parse_vorbis_tags(mock_tags)
+
+    assert result.get("artists") == ["Plural Artist 1", "Plural Artist 2"]
 
 
 def test_parse_vorbis_tags_musicbrainz_ids() -> None:
@@ -606,17 +571,15 @@ async def test_flac_multiple_artist_fields_semicolon_e2e() -> None:
     assert audio_tags.album == "Lovable"
 
 
-def test_id3_artist_tag_semicolon_single_mbid() -> None:
-    """Test that single ARTIST tag with semicolon is not split when 1 MB ID exists.
+def test_artist_tag_semicolon_split() -> None:
+    """Test that the single ARTIST field is split on semicolons in the fallback path.
 
-    Regression test for formats without multi-value ARTISTS tag support (ID3, etc.):
-    - Artist name "ave;new" contains a semicolon
-    - Single MUSICBRAINZ_ARTISTID confirms this is one artist
-    - The semicolon must NOT cause the name to be split into "ave" and "new"
-
-    See: https://musicbrainz.org/artist/2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba
+    The "ave;new" semicolon-in-name case is handled by resolving the MusicBrainz
+    Artist ID (see test_resolve_artists_from_mbids_handles_semicolon_in_name) which
+    happens at the provider layer before this property is consulted. This test only
+    verifies the property's tag-parsing fallback behaviour when no MBID resolution
+    has happened.
     """
-    # Simulate ID3 tags: single ARTIST field with semicolon, single MB ID
     audio_tags = tags.AudioTags(
         raw={},
         sample_rate=44100,
@@ -626,33 +589,22 @@ def test_id3_artist_tag_semicolon_single_mbid() -> None:
         bit_rate=None,
         duration=180.0,
         tags={
-            "title": "Colorful",
-            "album": "Lovable",
-            "artist": "ave;new",
-            "musicbrainzartistid": "2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba",
+            "artist": "Artist A;Artist B",
         },
         has_cover_image=False,
-        filename="01 - ave;new - Colorful.mp3",
+        filename="test.mp3",
     )
 
-    # Single MB ID = single artist, no splitting
-    assert audio_tags.artists == ("ave;new",)
-    assert audio_tags.musicbrainz_artistids == ("2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba",)
-    # Verify the semicolon did NOT cause incorrect splitting
-    assert "ave" not in audio_tags.artists
-    assert "new" not in audio_tags.artists
+    assert audio_tags.artists == ("Artist A", "Artist B")
 
 
-def test_artists_tag_semicolon_single_mbid() -> None:
-    """Test that ARTISTS tag with semicolon is not split when 1 MB ID exists.
+def test_artist_tag_single_mbid_preserves_semicolon_name() -> None:
+    """A lone MBID disambiguates a semicolon-in-name single artist on the fallback path.
 
-    Regression test for the ARTISTS (plural) tag path:
-    - Artist name "ave;new" contains a semicolon
-    - Single MUSICBRAINZ_ARTISTID confirms this is one artist
-    - The semicolon must NOT cause the name to be split
-
-    Based on real tags from ave;new's "Lovable" album track "eve".
-    See: https://musicbrainz.org/artist/2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba
+    Even without the MB lookup running, the property must trust that one MBID
+    means one artist and return the raw tag string intact. Otherwise "ave;new"
+    would be split into ("ave", "new") whenever the MB mirror is unreachable
+    or the MB provider isn't loaded.
     """
     audio_tags = tags.AudioTags(
         raw={},
@@ -663,32 +615,18 @@ def test_artists_tag_semicolon_single_mbid() -> None:
         bit_rate=None,
         duration=180.0,
         tags={
-            "title": "eve",
-            "album": "Lovable",
             "artist": "ave;new",
-            "artists": "ave;new",  # ARTISTS tag with semicolon
-            "artistsort": "ave;new",
             "musicbrainzartistid": "2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba",
-            "musicbrainzrecordingid": "0389384e-3015-45ba-8a09-d949ff68f9d9",
         },
         has_cover_image=False,
-        filename="04 - ave;new - eve.flac",
+        filename="test.flac",
     )
 
-    # Single MB ID = single artist, ARTISTS tag should NOT be split on semicolon
     assert audio_tags.artists == ("ave;new",)
-    assert audio_tags.musicbrainz_artistids == ("2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba",)
-    # Verify the semicolon did NOT cause incorrect splitting
-    assert "ave" not in audio_tags.artists
-    assert "new" not in audio_tags.artists
 
 
-def test_id3_artist_tag_semicolon_multiple_mbids() -> None:
-    """Test that ARTIST tag with semicolon IS split when multiple MB IDs exist.
-
-    When multiple MusicBrainz Artist IDs are present, the semicolon should be
-    treated as a separator between artists.
-    """
+def test_albumartist_tag_semicolon_split() -> None:
+    """Test that the single ALBUMARTIST field is split on semicolons in the fallback."""
     audio_tags = tags.AudioTags(
         raw={},
         sample_rate=44100,
@@ -697,28 +635,24 @@ def test_id3_artist_tag_semicolon_multiple_mbids() -> None:
         format="mp3",
         bit_rate=None,
         duration=180.0,
-        # musicbrainzartistid can be list[str] from mutagen (dict type is str for ffprobe compat)
         tags={
-            "artist": "Artist A;Artist B",
-            "musicbrainzartistid": ["id-a", "id-b"],  # type: ignore[dict-item]
+            "albumartist": "Artist A;Artist B",
         },
         has_cover_image=False,
         filename="test.mp3",
     )
 
-    # Multiple MB IDs = semicolon should split
-    assert audio_tags.artists == ("Artist A", "Artist B")
-    assert audio_tags.musicbrainz_artistids == ("id-a", "id-b")
+    assert audio_tags.album_artists == ("Artist A", "Artist B")
 
 
-def test_id3_albumartist_tag_semicolon_single_mbid() -> None:
-    """Test that ALBUMARTIST tag with semicolon is not split when 1 MB Album Artist ID exists."""
+def test_albumartist_tag_single_mbid_preserves_semicolon_name() -> None:
+    """Mirror of test_artist_tag_single_mbid_preserves_semicolon_name for album artists."""
     audio_tags = tags.AudioTags(
         raw={},
         sample_rate=44100,
         channels=2,
         bits_per_sample=16,
-        format="mp3",
+        format="flac",
         bit_rate=None,
         duration=180.0,
         tags={
@@ -726,12 +660,10 @@ def test_id3_albumartist_tag_semicolon_single_mbid() -> None:
             "musicbrainzalbumartistid": "2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba",
         },
         has_cover_image=False,
-        filename="test.mp3",
+        filename="test.flac",
     )
 
-    # Single MB Album Artist ID = single artist, no splitting
     assert audio_tags.album_artists == ("ave;new",)
-    assert audio_tags.musicbrainz_albumartistids == ("2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba",)
 
 
 def _read_replaygain_track_gain(path: str) -> str | None:
@@ -782,3 +714,69 @@ async def test_write_replaygain_track_gain_read_only(tmp_path: pathlib.Path) -> 
     finally:
         # restore permissions so tmp_path cleanup can remove the file
         dest.chmod(0o644)
+
+
+async def test_resolve_artists_from_mbids_handles_semicolon_in_name() -> None:
+    """End-to-end test for the MBID resolution path with a semicolon-in-name artist.
+
+    "ave;new" is a real Japanese artist whose name contains a semicolon. The only
+    way to correctly resolve this artist when the file uses a single ARTIST/ARTISTS
+    field is to look up the canonical name via the MusicBrainz Artist ID.
+
+    See: https://musicbrainz.org/artist/2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba
+    """
+    mbid = "2ade7b3c-a6f1-4d00-b7f7-fc60abf25dba"
+    mock_artist = MagicMock()
+    mock_artist.name = "ave;new"
+    mock_artist.sort_name = "ave;new"
+
+    mock_provider = MagicMock()
+    mock_provider.get_artist_details = AsyncMock(return_value=mock_artist)
+
+    resolved = await tags.resolve_artists_from_mbids((mbid,), mock_provider)
+
+    assert resolved == [("ave;new", mbid, "ave;new")]
+    mock_provider.get_artist_details.assert_awaited_once_with(mbid)
+
+
+async def test_resolve_artists_from_mbids_partial_failure_preserves_positions() -> None:
+    """A failed MBID lookup yields None at its position, not list-shrinking.
+
+    The position-aligned return shape lets callers index-fall-back to the raw
+    tag string for the failed MBID, instead of silently dropping that artist
+    and shifting subsequent positions.
+    """
+    mbids = ("aaa", "bbb", "ccc")
+    artist_a = MagicMock(name="A", sort_name="A")
+    artist_a.name = "Artist A"
+    artist_a.sort_name = "Artist A sort"
+    artist_c = MagicMock()
+    artist_c.name = "Artist C"
+    artist_c.sort_name = "Artist C sort"
+
+    async def fake_get(mbid: str) -> MagicMock:
+        if mbid == "bbb":
+            raise InvalidDataError("boom")
+        return artist_a if mbid == "aaa" else artist_c
+
+    mock_provider = MagicMock()
+    mock_provider.get_artist_details = AsyncMock(side_effect=fake_get)
+
+    resolved = await tags.resolve_artists_from_mbids(mbids, mock_provider)
+
+    assert resolved == [
+        ("Artist A", "aaa", "Artist A sort"),
+        None,
+        ("Artist C", "ccc", "Artist C sort"),
+    ]
+
+
+async def test_resolve_artists_from_mbids_all_failed_returns_all_none() -> None:
+    """All-fail case: every position is None; caller can fall back wholesale to tags."""
+    mbids = ("aaa", "bbb")
+    mock_provider = MagicMock()
+    mock_provider.get_artist_details = AsyncMock(side_effect=InvalidDataError("boom"))
+
+    resolved = await tags.resolve_artists_from_mbids(mbids, mock_provider)
+
+    assert resolved == [None, None]

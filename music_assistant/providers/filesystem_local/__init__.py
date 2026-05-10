@@ -69,7 +69,12 @@ from music_assistant.controllers.tasks.context import (
 from music_assistant.helpers.compare import compare_strings, create_safe_string
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.playlists import parse_m3u, parse_pls
-from music_assistant.helpers.tags import AudioTags, async_parse_tags, split_items
+from music_assistant.helpers.tags import (
+    AudioTags,
+    async_parse_tags,
+    resolve_artists_from_mbids,
+    split_items,
+)
 from music_assistant.helpers.util import (
     TaskManager,
     detect_charset,
@@ -119,6 +124,7 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+    from music_assistant.providers.musicbrainz import MusicbrainzProvider
 
 
 isdir = wrap(os.path.isdir)
@@ -1055,27 +1061,52 @@ class LocalFileSystemProvider(MusicProvider):
             else None
         )
 
-        # track artist(s)
-        for index, track_artist_str in enumerate(tags.artists):
+        # track artist(s) - prefer canonical names from MusicBrainz when MB IDs are present,
+        # with a per-position fallback to the tag-parsed name for any MBID that fails
+        # to resolve (transient mirror failure, deleted/bad MBID, etc.).
+        mb_provider = cast("MusicbrainzProvider | None", self.mass.get_provider("musicbrainz"))
+        resolved_artists: list[tuple[str, str | None, str | None]] = []
+        if tags.musicbrainz_artistids:
+            mb_results: list[tuple[str, str, str] | None] = (
+                await resolve_artists_from_mbids(tags.musicbrainz_artistids, mb_provider)
+                if mb_provider
+                else [None] * len(tags.musicbrainz_artistids)
+            )
+            tag_artists = tags.artists
+            for index, (tag_mbid, mb_result) in enumerate(
+                zip(tags.musicbrainz_artistids, mb_results, strict=True)
+            ):
+                if mb_result is not None:
+                    resolved_artists.append(mb_result)
+                elif index < len(tag_artists):
+                    tag_sort_name = (
+                        tags.artist_sort_names[index]
+                        if index < len(tags.artist_sort_names)
+                        else None
+                    )
+                    resolved_artists.append((tag_artists[index], tag_mbid, tag_sort_name))
+                # else: position has no recoverable name; resolver already logged
+        else:
+            resolved_artists = [
+                (
+                    track_artist_str,
+                    None,
+                    (
+                        tags.artist_sort_names[index]
+                        if index < len(tags.artist_sort_names)
+                        else None
+                    ),
+                )
+                for index, track_artist_str in enumerate(tags.artists)
+            ]
+        for name, mbid, sort_name in resolved_artists:
             # prefer album artist if match
             if album and (
-                album_artist_match := next(
-                    (x for x in album.artists if x.name == track_artist_str), None
-                )
+                album_artist_match := next((x for x in album.artists if x.name == name), None)
             ):
                 track.artists.append(album_artist_match)
                 continue
-            artist = await self._parse_artist(
-                track_artist_str,
-                sort_name=(
-                    tags.artist_sort_names[index] if index < len(tags.artist_sort_names) else None
-                ),
-                mbid=(
-                    tags.musicbrainz_artistids[index]
-                    if index < len(tags.musicbrainz_artistids)
-                    else None
-                ),
-            )
+            artist = await self._parse_artist(name, sort_name=sort_name, mbid=mbid)
             track.artists.append(artist)
 
         # handle embedded cover image
@@ -1539,26 +1570,53 @@ class LocalFileSystemProvider(MusicProvider):
         ):
             return cache  # type: ignore[no-any-return]
 
-        # album artist(s)
+        # album artist(s) - prefer canonical names from MusicBrainz when MB IDs are
+        # present, with a per-position fallback to the tag-parsed name for any MBID
+        # that fails to resolve.
         album_artists: UniqueList[Artist | ItemMapping] = UniqueList()
-        if track_tags.album_artists:
-            for index, album_artist_str in enumerate(track_tags.album_artists):
-                artist = await self._parse_artist(
+        mb_provider = cast("MusicbrainzProvider | None", self.mass.get_provider("musicbrainz"))
+        resolved_album_artists: list[tuple[str, str | None, str | None]] = []
+        if track_tags.musicbrainz_albumartistids:
+            mb_results: list[tuple[str, str, str] | None] = (
+                await resolve_artists_from_mbids(track_tags.musicbrainz_albumartistids, mb_provider)
+                if mb_provider
+                else [None] * len(track_tags.musicbrainz_albumartistids)
+            )
+            tag_album_artists = track_tags.album_artists
+            for index, (tag_mbid, mb_result) in enumerate(
+                zip(track_tags.musicbrainz_albumartistids, mb_results, strict=True)
+            ):
+                if mb_result is not None:
+                    resolved_album_artists.append(mb_result)
+                elif index < len(tag_album_artists):
+                    tag_sort_name = (
+                        track_tags.album_artist_sort_names[index]
+                        if index < len(track_tags.album_artist_sort_names)
+                        else None
+                    )
+                    resolved_album_artists.append(
+                        (tag_album_artists[index], tag_mbid, tag_sort_name)
+                    )
+        elif track_tags.album_artists:
+            resolved_album_artists = [
+                (
                     album_artist_str,
-                    album_dir=album_dir,
-                    sort_name=(
+                    None,
+                    (
                         track_tags.album_artist_sort_names[index]
                         if index < len(track_tags.album_artist_sort_names)
                         else None
                     ),
-                    mbid=(
-                        track_tags.musicbrainz_albumartistids[index]
-                        if index < len(track_tags.musicbrainz_albumartistids)
-                        else None
-                    ),
                 )
-                album_artists.append(artist)
-        else:
+                for index, album_artist_str in enumerate(track_tags.album_artists)
+            ]
+        for name, mbid, sort_name in resolved_album_artists:
+            artist = await self._parse_artist(
+                name, album_dir=album_dir, sort_name=sort_name, mbid=mbid
+            )
+            album_artists.append(artist)
+
+        if not album_artists:
             # album artist tag is missing, determine fallback
             fallback_action = self.config.get_value(CONF_ENTRY_MISSING_ALBUM_ARTIST.key)
             if fallback_action == "folder_name" and album_dir:

@@ -11,11 +11,14 @@ from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from json import JSONDecodeError
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from music_assistant.providers.musicbrainz import MusicbrainzProvider
 
 import mutagen
 from music_assistant_models.enums import AlbumType
-from music_assistant_models.errors import InvalidDataError
+from music_assistant_models.errors import InvalidDataError, RetriesExhausted
 from mutagen._vorbis import VCommentDict
 from mutagen.apev2 import APEv2
 from mutagen.id3 import ID3, TXXX  # type: ignore[attr-defined]
@@ -69,23 +72,13 @@ def split_items(
     return clean_tuple((org_str,))
 
 
-# Artist splitting logic:
-# When not using the multi-artist tag (ARTISTS), the artist string may contain
-# multiple artists in freeform. Featuring artists may also be included in this
-# string. We parse and separate them based on common splitter patterns.
+# Artist splitting logic for the single-value ARTIST field fallback (i.e. when
+# the format-native multi-value mechanism and the plural ARTISTS tag are both
+# absent). Splits on semicolons first, then on "featuring" patterns.
 #
-# We use the MusicBrainz Artist ID count as a guide for how many artists to extract:
-# - 0 IDs: only split on "featuring" splitters (to capture feat. artists in DB)
-# - 1 ID: don't split at all (single artist confirmed)
-# - 2+ IDs: split on featuring first, then extra splitters until we reach the target count
-#
-# TODO: If a MusicBrainz mirror/local database was available, artist names could be
-# looked up directly using the MB Artist IDs from the tags, eliminating the need for
-# ARTISTS tag parsing or ARTIST tag splitting entirely.
-#
-# Featuring splitters - always split on these to capture featuring artists in the database
-# Featuring splitters - case-insensitive patterns (searched with lower())
-# These always split to capture featuring artists in the database
+# Note: When MusicBrainz Artist IDs are present in tags, the resolve_artists_from_mbids()
+# function looks up canonical artist names via the MusicBrainz API and the filesystem_local
+# provider uses those directly, bypassing this fallback entirely.
 FEATURING_SPLITTERS = [
     " featuring ",
     " feat. ",
@@ -99,9 +92,6 @@ FEATURING_SPLITTERS = [
     "(feat. ",
     "(ft. ",
 ]
-
-# Extra splitters - only use these when we have MB ID evidence of multiple artists
-EXTRA_SPLITTERS = [" & ", ", ", " + ", " with "]
 
 
 def _split_on_featuring(item: str) -> list[str]:
@@ -122,117 +112,18 @@ def _split_on_featuring(item: str) -> list[str]:
     return [item]
 
 
-def _split_to_target_count(
-    artists: list[str],
-    expected_count: int,
-    org_artists: str | tuple[str, ...],
-) -> list[str]:
+def split_artists(org_artists: str | tuple[str, ...]) -> tuple[str, ...]:
     """
-    Split artists on extra splitters to reach expected count.
+    Split an artist string on the semicolon separator and featuring patterns.
 
-    :param artists: List of artists after featuring splits.
-    :param expected_count: Target number of artists.
-    :param org_artists: Original input for logging.
-    """
-    current_artists = list(artists)
-    stopped_early = False
-
-    # Keep iterating until we reach the target or can't split anymore
-    while len(current_artists) < expected_count:
-        made_progress = False
-
-        for i, item in enumerate(current_artists):
-            if len(current_artists) >= expected_count:
-                break
-
-            for splitter in EXTRA_SPLITTERS:
-                if splitter not in item:
-                    continue
-
-                parts = [p.strip() for p in item.split(splitter) if p.strip()]
-                if len(parts) <= 1:
-                    continue
-
-                potential_count = len(current_artists) - 1 + len(parts)
-
-                if potential_count <= expected_count:
-                    # Safe to split fully - replace item with its parts
-                    current_artists = current_artists[:i] + parts + current_artists[i + 1 :]
-                    made_progress = True
-                else:
-                    # Splitting would exceed target - do partial split
-                    needed = expected_count - len(current_artists) + 1
-                    if needed >= 2:
-                        new_parts = [*parts[: needed - 1], splitter.join(parts[needed - 1 :])]
-                        current_artists = current_artists[:i] + new_parts + current_artists[i + 1 :]
-                        made_progress = True
-                        stopped_early = True
-                break  # Only use first matching splitter for this item
-
-            if made_progress:
-                break  # Restart the outer loop with updated list
-
-        if not made_progress:
-            break  # No more splitting possible
-
-    # Remove duplicates while preserving order
-    seen: set[str] = set()
-    final_artists = []
-    for artist in current_artists:
-        if artist and artist not in seen:
-            seen.add(artist)
-            final_artists.append(artist)
-
-    if stopped_early:
-        LOGGER.warning(
-            "Artist splitting stopped early to match expected count %d: '%s'",
-            expected_count,
-            org_artists,
-        )
-    elif len(final_artists) < expected_count:
-        LOGGER.warning(
-            "Could not split artist string to match expected count %d (got %d): '%s'",
-            expected_count,
-            len(final_artists),
-            org_artists,
-        )
-
-    return final_artists
-
-
-def split_artists(
-    org_artists: str | tuple[str, ...],
-    expected_count: int | None = None,
-) -> tuple[str, ...]:
-    """
-    Parse artists from a string, guided by expected artist count.
-
-    :param org_artists: The artist string or tuple of strings to parse.
-    :param expected_count: Expected number of artists (typically from MB artist IDs).
-        If None or 0: only split on "featuring" splitters, no extra splitting.
-        If 1: return as-is without any splitting.
-        If > 1: split on featuring splitters first, then extra splitters to reach target.
+    :param org_artists: The artist string (or pre-split tuple) to parse.
     """
     artists = split_items(org_artists, allow_unsafe_splitters=False)
-
-    # If expected_count is 1, return as-is without any splitting
-    if expected_count == 1:
-        return artists
-
-    # Step 1: Always split on featuring splitters
     final_artists: list[str] = []
     for item in artists:
         for part in _split_on_featuring(item):
             if part and part not in final_artists:
                 final_artists.append(part)
-
-    # Step 2: If no expected_count or already at/above target, we're done
-    if not expected_count or expected_count <= 1 or len(final_artists) >= expected_count:
-        return tuple(final_artists) if final_artists else artists
-
-    # Step 3: Need more artists - split on extra splitters to reach expected_count
-    final_artists = _split_to_target_count(final_artists, expected_count, org_artists)
-
     return tuple(final_artists) if final_artists else artists
 
 
@@ -296,99 +187,80 @@ class AudioTags:
 
     @property
     def artists(self) -> tuple[str, ...]:
-        """Return track artists."""
-        # Preferred path when unambiguously separated artist names are available
-        # Vorbis: multiple ARTIST fields, ID3: TXXX:ARTISTS or multi-value TPE1
-        # APEv2: null-separated ARTISTS tag (if present), MP4: not supported
+        """
+        Return track artists, falling back to a filename heuristic and finally UNKNOWN_ARTIST.
+
+        When MusicBrainz Artist IDs are present, callers should resolve names through
+        the MusicBrainz API instead of relying on this property.
+        """
+        # Resolution order (first match wins):
+        #   1. tags["artists"] - populated by the parser from a format-native multi-value
+        #      field (Vorbis multi ARTIST, ID3v2.4 null-separated TPE1, APEv2 null-separated
+        #      Artist, MP4 iTunes ARTISTS) or the non-standard plural ARTISTS tag.
+        #   2. tags["artist"] - single field, split on the semicolon delimiter and then
+        #      on featuring patterns.
+        #   3. Filename heuristic, otherwise UNKNOWN_ARTIST.
+        # A single MBID means a single artist; preserve the raw tag string so names
+        # containing the semicolon delimiter (e.g. "ave;new") survive when MB lookup
+        # isn't available.
+        single_mbid = len(self.musicbrainz_artistids) == 1
         if tag := self.tags.get("artists"):
-            mb_id_count = len(self.musicbrainz_artistids)
-            # Runtime check: mutagen returns list[str] for Vorbis multi-field
+            # A list with >1 entries is authoritative (already separated by the
+            # format-native multi-value mechanism). A single-entry list / string
+            # can only come from the plural ARTISTS tag - treat it the same as a
+            # single ARTIST field and apply the full fallback splitting.
             if isinstance(tag, list) and len(tag) > 1:  # type: ignore[unreachable]
-                # Multiple ARTIST fields from Vorbis - already separated, no splitting needed
-                artists = clean_tuple(tag)  # type: ignore[unreachable]
-            elif mb_id_count == 1:
-                # Single MB ID confirms single artist - don't split
+                return clean_tuple(tag)  # type: ignore[unreachable]
+            if single_mbid:
                 return (tag if isinstance(tag, str) else tag[0],)
-            else:
-                # Split on semicolons
-                artists = split_items(tag)
-            # Warn if ARTISTS tag count doesn't match MB Artist ID count
-            if mb_id_count and mb_id_count != len(artists):
-                LOGGER.warning(
-                    "ARTISTS tag count (%d) doesn't match MusicBrainz Artist ID count (%d): %s",
-                    len(artists),
-                    mb_id_count,
-                    tag,
-                )
-            return artists
-        # Fallback to single artist string, splitting if necessary
-        # All formats: parser returns artist (singular)
-        # APEv2: also falls through here if no ARTISTS tag present
+            return split_artists(tag)
         if tag := self.tags.get("artist"):
-            mb_id_count = len(self.musicbrainz_artistids)
-            if mb_id_count == 1:
+            if single_mbid:
                 return (tag,)
-            if TAG_SPLITTER in tag:
-                return split_items(tag)
-            return split_artists(tag, expected_count=mb_id_count or None)
-        # fallback to parsing from filename
+            return split_artists(tag)
+        # Last resort: parse from filename
         title = self.filename.rsplit(os.sep, 1)[-1].split(".")[0]
         if " - " in title:
             title_parts = title.split(" - ")
             if len(title_parts) >= 2:
-                # No MB IDs from filename, only split on featuring splitters
-                return split_artists(title_parts[0], expected_count=None)
+                return split_artists(title_parts[0])
         return (UNKNOWN_ARTIST,)
 
     @property
     def writers(self) -> tuple[str, ...]:
         """Return writer(s)."""
-        # prefer multi-item tag
         if tag := self.tags.get("writers"):
             return split_items(tag)
-        # fallback to regular writer string
         if tag := self.tags.get("writer"):
-            if TAG_SPLITTER in tag:
-                return split_items(tag)
-            # No MB IDs for writers, only split on featuring splitters
-            return split_artists(tag, expected_count=None)
+            return split_artists(tag)
         return ()
 
     @property
     def album_artists(self) -> tuple[str, ...]:
-        """Return (all) album artists (if any)."""
-        # Preferred path when unambiguously separated album artist names are available
-        # Vorbis: multiple ALBUMARTIST fields, ID3: multi-value TPE2
+        """
+        Return (all) album artists, if any.
+
+        When MusicBrainz Album Artist IDs are present, callers should resolve names
+        through the MusicBrainz API instead of relying on this property.
+        """
+        # Resolution order (first match wins):
+        #   1. tags["albumartists"] - populated by the parser from a format-native
+        #      multi-value field (Vorbis multi ALBUMARTIST, ID3v2.4 null-separated TPE2,
+        #      APEv2 null-separated Album Artist). There is no standard plural
+        #      album-artist tag.
+        #   2. tags["albumartist"] - single field, split on the semicolon delimiter.
+        # See artists property - same single-MBID-wins-over-punctuation rule.
+        single_mbid = len(self.musicbrainz_albumartistids) == 1
         if tag := self.tags.get("albumartists"):
-            mb_id_count = len(self.musicbrainz_albumartistids)
-            # Runtime check: mutagen returns list[str] for Vorbis multi-field
             if isinstance(tag, list) and len(tag) > 1:  # type: ignore[unreachable]
-                # Multiple ALBUMARTIST fields from Vorbis - already separated, no splitting needed
-                artists = clean_tuple(tag)  # type: ignore[unreachable]
-            elif mb_id_count == 1:
-                # Single MB ID confirms single artist - don't split
+                return clean_tuple(tag)  # type: ignore[unreachable]
+            if single_mbid:
                 return (tag if isinstance(tag, str) else tag[0],)
-            else:
-                # Split on semicolons
-                artists = split_items(tag)
-            # Warn if ALBUMARTISTS tag count doesn't match MB Album Artist ID count
-            if mb_id_count and mb_id_count != len(artists):
-                LOGGER.warning(
-                    "ALBUMARTISTS tag count (%d) doesn't match MB Album Artist ID count (%d): %s",
-                    len(artists),
-                    mb_id_count,
-                    tag,
-                )
-            return artists
-        # Fallback to single album artist string, splitting if necessary
-        # All formats: parser returns albumartist (singular)
+            return split_items(tag)
         if tag := self.tags.get("albumartist"):
-            mb_id_count = len(self.musicbrainz_albumartistids)
-            if mb_id_count == 1:
+            if single_mbid:
                 return (tag,)
-            if TAG_SPLITTER in tag:
-                return split_items(tag)
-            return split_artists(tag, expected_count=mb_id_count or None)
+            return split_items(tag)
         return ()
 
     @property
@@ -921,8 +793,8 @@ def _parse_id3_tags(tags: dict[str, Any]) -> dict[str, Any]:
     """
     Parse ID3 tags (MP3 files) from mutagen tags dict.
 
-    See: https://mutagen-specs.readthedocs.io/en/latest/id3/id3v2.4.0-frames.html
     See: https://picard-docs.musicbrainz.org/en/appendices/tag_mapping.html
+    See: https://picard-docs.musicbrainz.org/en/variables/tags_basic.html
 
     :param tags: Dictionary of ID3 tags from mutagen.
     """
@@ -950,8 +822,9 @@ def _parse_id3_tags(tags: dict[str, Any]) -> dict[str, Any]:
     if (frame := tags.get("TCON")) and frame.text:
         result["genre"] = frame.text
 
-    # Explicit multi-value artist tag (takes precedence)
-    if (frame := tags.get("TXXX:ARTISTS")) and frame.text:
+    # TXXX:ARTISTS is the recommended multi-artist tag for ID3. Use it as a
+    # fallback when TPE1 didn't already provide null-separated multi-values.
+    if "artists" not in result and (frame := tags.get("TXXX:ARTISTS")) and frame.text:
         result["artists"] = frame.text
 
     # MusicBrainz tags (single value)
@@ -1020,40 +893,28 @@ def _parse_vorbis_artist_tags(tags: VCommentDict, result: dict[str, Any]) -> Non
     """
     Parse artist-related tags from Vorbis comments into result dict.
 
-    Handles multiple ARTIST/ALBUMARTIST fields per Vorbis spec, as well as
-    explicit ARTISTS tag which take precedence.
-
     :param tags: VCommentDict from mutagen.
     :param result: Dictionary to store parsed tags.
     """
-    # Artist tags - check for multiple values (per Vorbis spec recommendation)
-    # Multiple ARTIST fields are treated the same as an ARTISTS tag
     artist_values = _vorbis_get_multi(tags, "ARTIST")
     if artist_values:
         if len(artist_values) > 1:
-            # Multiple ARTIST fields - treat as authoritative list (like ARTISTS tag)
             result["artists"] = artist_values
         else:
-            # Single ARTIST field - use normal parsing logic
             result["artist"] = artist_values[0]
 
-    # Album artist tags - same logic for multiple values
     albumartist_values = _vorbis_get_multi(tags, "ALBUMARTIST")
     if albumartist_values:
         if len(albumartist_values) > 1:
-            # Multiple ALBUMARTIST fields - treat as authoritative list
             result["albumartists"] = albumartist_values
         else:
             result["albumartist"] = albumartist_values[0]
 
-    # ARTISTS (plural) is non-standard in Vorbis - it's a MusicBrainz/Picard ID3 convention.
-    # Vorbis spec recommends multiple ARTIST (singular) fields instead.
-    # We can however accept it. See: https://xiph.org/vorbis/doc/v-comment.html
-    if artists := _vorbis_get_multi(tags, "ARTISTS"):
+    # ARTISTS (plural) is non-standard in Vorbis (a MusicBrainz/Picard ID3 convention).
+    # Accept it only as a fallback when multiple ARTIST fields didn't already populate
+    # the bucket. See: https://xiph.org/vorbis/doc/v-comment.html
+    if "artists" not in result and (artists := _vorbis_get_multi(tags, "ARTISTS")):
         result["artists"] = artists
-
-    if albumartists := _vorbis_get_multi(tags, "ALBUMARTISTS"):
-        result["albumartists"] = albumartists
 
 
 def _parse_vorbis_tags(tags: VCommentDict) -> dict[str, Any]:
@@ -1211,8 +1072,9 @@ def _parse_apev2_tags(tags: APEv2) -> dict[str, Any]:  # noqa: PLR0915
     if genre := _apev2_get_multi(tags, "Genre"):
         result["genre"] = genre
 
-    # Explicit multi-artist support (ARTISTS tag takes precedence)
-    if artists := _apev2_get_multi(tags, "Artists"):
+    # Plural Artists tag - accept as a fallback when null-separated multi-value
+    # Artist field didn't already populate the bucket.
+    if "artists" not in result and (artists := _apev2_get_multi(tags, "Artists")):
         result["artists"] = artists
 
     # MusicBrainz IDs - single value
@@ -1467,3 +1329,33 @@ def _write_replaygain_track_gain_sync(path: str, track_gain_db: float) -> bool:
     except Exception as err:
         LOGGER.warning("unexpected failure writing replaygain tag to %s: %s", path, err)
         return False
+
+
+async def resolve_artists_from_mbids(
+    mbids: tuple[str, ...],
+    mb_provider: MusicbrainzProvider,
+) -> list[tuple[str, str, str] | None]:
+    """
+    Look up canonical artist names from MusicBrainz IDs.
+
+    Each input MBID maps to one entry in the returned list. Failed lookups appear
+    as ``None`` so callers can fall back to the tag-parsed name for that position.
+
+    :param mbids: Tuple of MusicBrainz artist IDs to look up.
+    :param mb_provider: MusicBrainz provider instance for API lookups.
+    :return: List of ``(name, mbid, sort_name)`` tuples, with ``None`` at the
+        position of any MBID that failed to resolve.
+    """
+    results: list[tuple[str, str, str] | None] = []
+    for mbid in mbids:
+        try:
+            artist = await mb_provider.get_artist_details(mbid)
+            results.append((artist.name, mbid, artist.sort_name))
+        except (InvalidDataError, RetriesExhausted) as err:
+            # InvalidDataError: bad / deleted / malformed MBID, or sparse MB record.
+            # RetriesExhausted: MB mirror unavailable past the throttler's retry budget.
+            # Wire-level aiohttp errors deliberately propagate — those indicate a broken
+            # mirror, not a per-artist data problem, and should fail the scan loudly.
+            LOGGER.warning("Failed to lookup MusicBrainz artist %s: %s", mbid, err)
+            results.append(None)
+    return results
