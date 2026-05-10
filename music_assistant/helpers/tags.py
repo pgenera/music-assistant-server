@@ -72,13 +72,8 @@ def split_items(
     return clean_tuple((org_str,))
 
 
-# Artist splitting logic for the single-value ARTIST field fallback (i.e. when
-# the format-native multi-value mechanism and the plural ARTISTS tag are both
-# absent). Splits on semicolons first, then on "featuring" patterns.
-#
-# Note: When MusicBrainz Artist IDs are present in tags, the resolve_artists_from_mbids()
-# function looks up canonical artist names via the MusicBrainz API and the filesystem_local
-# provider uses those directly, bypassing this fallback entirely.
+# Splitters for the single-value ARTIST fallback path. Used only when the
+# format-native multi-value mechanism is absent and MBID lookup is unavailable.
 FEATURING_SPLITTERS = [
     " featuring ",
     " feat. ",
@@ -193,22 +188,17 @@ class AudioTags:
         When MusicBrainz Artist IDs are present, callers should resolve names through
         the MusicBrainz API instead of relying on this property.
         """
-        # Resolution order (first match wins):
-        #   1. tags["artists"] - populated by the parser from a format-native multi-value
-        #      field (Vorbis multi ARTIST, ID3v2.4 null-separated TPE1, APEv2 null-separated
-        #      Artist, MP4 iTunes ARTISTS) or the non-standard plural ARTISTS tag.
-        #   2. tags["artist"] - single field, split on the semicolon delimiter and then
-        #      on featuring patterns.
+        # Resolution order:
+        #   1. tags["artists"] - format-native multi-value or plural ARTISTS tag.
+        #   2. tags["artist"] - single field, split on ';' then featuring patterns.
         #   3. Filename heuristic, otherwise UNKNOWN_ARTIST.
-        # A single MBID means a single artist; preserve the raw tag string so names
-        # containing the semicolon delimiter (e.g. "ave;new") survive when MB lookup
-        # isn't available.
+        # A single MBID confirms a single artist; preserve the raw string so names
+        # containing semicolons survive when MB lookup is unavailable.
         single_mbid = len(self.musicbrainz_artistids) == 1
         if tag := self.tags.get("artists"):
-            # A list with >1 entries is authoritative (already separated by the
-            # format-native multi-value mechanism). A single-entry list / string
-            # can only come from the plural ARTISTS tag - treat it the same as a
-            # single ARTIST field and apply the full fallback splitting.
+            # Multi-entry list is authoritative (format-native multi-value); a
+            # single entry can only be the plural ARTISTS tag, so apply the full
+            # fallback splitting.
             if isinstance(tag, list) and len(tag) > 1:  # type: ignore[unreachable]
                 return clean_tuple(tag)  # type: ignore[unreachable]
             if single_mbid:
@@ -243,13 +233,10 @@ class AudioTags:
         When MusicBrainz Album Artist IDs are present, callers should resolve names
         through the MusicBrainz API instead of relying on this property.
         """
-        # Resolution order (first match wins):
-        #   1. tags["albumartists"] - populated by the parser from a format-native
-        #      multi-value field (Vorbis multi ALBUMARTIST, ID3v2.4 null-separated TPE2,
-        #      APEv2 null-separated Album Artist). There is no standard plural
-        #      album-artist tag.
-        #   2. tags["albumartist"] - single field, split on the semicolon delimiter.
-        # See artists property - same single-MBID-wins-over-punctuation rule.
+        # Resolution order:
+        #   1. tags["albumartists"] - format-native multi-value (no standard plural tag).
+        #   2. tags["albumartist"] - single field, split on ';'.
+        # Same single-MBID-wins-over-punctuation rule as the artists property.
         single_mbid = len(self.musicbrainz_albumartistids) == 1
         if tag := self.tags.get("albumartists"):
             if isinstance(tag, list) and len(tag) > 1:  # type: ignore[unreachable]
@@ -822,8 +809,7 @@ def _parse_id3_tags(tags: dict[str, Any]) -> dict[str, Any]:
     if (frame := tags.get("TCON")) and frame.text:
         result["genre"] = frame.text
 
-    # TXXX:ARTISTS is the recommended multi-artist tag for ID3. Use it as a
-    # fallback when TPE1 didn't already provide null-separated multi-values.
+    # Fall back to TXXX:ARTISTS only if TPE1 didn't already provide multi-values.
     if "artists" not in result and (frame := tags.get("TXXX:ARTISTS")) and frame.text:
         result["artists"] = frame.text
 
@@ -910,9 +896,9 @@ def _parse_vorbis_artist_tags(tags: VCommentDict, result: dict[str, Any]) -> Non
         else:
             result["albumartist"] = albumartist_values[0]
 
-    # ARTISTS (plural) is non-standard in Vorbis (a MusicBrainz/Picard ID3 convention).
-    # Accept it only as a fallback when multiple ARTIST fields didn't already populate
-    # the bucket. See: https://xiph.org/vorbis/doc/v-comment.html
+    # Plural ARTISTS is non-standard in Vorbis; accept as a fallback only if
+    # multiple ARTIST fields didn't populate the bucket.
+    # See: https://xiph.org/vorbis/doc/v-comment.html
     if "artists" not in result and (artists := _vorbis_get_multi(tags, "ARTISTS")):
         result["artists"] = artists
 
@@ -1072,8 +1058,7 @@ def _parse_apev2_tags(tags: APEv2) -> dict[str, Any]:  # noqa: PLR0915
     if genre := _apev2_get_multi(tags, "Genre"):
         result["genre"] = genre
 
-    # Plural Artists tag - accept as a fallback when null-separated multi-value
-    # Artist field didn't already populate the bucket.
+    # Fall back to plural Artists only if null-separated Artist didn't populate the bucket.
     if "artists" not in result and (artists := _apev2_get_multi(tags, "Artists")):
         result["artists"] = artists
 
@@ -1352,9 +1337,7 @@ async def resolve_artists_from_mbids(
             artist = await mb_provider.get_artist_details(mbid)
             results.append((artist.name, mbid, artist.sort_name))
         except (InvalidDataError, RetriesExhausted) as err:
-            # InvalidDataError: bad / deleted / malformed MBID, or sparse MB record.
-            # RetriesExhausted: MB mirror unavailable past the throttler's retry budget.
-            # Wire-level aiohttp errors deliberately propagate — those indicate a broken
+            # Wire-level aiohttp errors deliberately propagate; those indicate a broken
             # mirror, not a per-artist data problem, and should fail the scan loudly.
             LOGGER.warning("Failed to lookup MusicBrainz artist %s: %s", mbid, err)
             results.append(None)

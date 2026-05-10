@@ -1061,9 +1061,8 @@ class LocalFileSystemProvider(MusicProvider):
             else None
         )
 
-        # track artist(s) - prefer canonical names from MusicBrainz when MB IDs are present,
-        # with a per-position fallback to the tag-parsed name for any MBID that fails
-        # to resolve (transient mirror failure, deleted/bad MBID, etc.).
+        # Track artists: use canonical MB names when MBIDs are present, with a
+        # per-position fallback to the tag-parsed name if a lookup fails.
         mb_provider = cast("MusicbrainzProvider | None", self.mass.get_provider("musicbrainz"))
         resolved_artists: list[tuple[str, str | None, str | None]] = []
         if tags.musicbrainz_artistids:
@@ -1570,9 +1569,8 @@ class LocalFileSystemProvider(MusicProvider):
         ):
             return cache  # type: ignore[no-any-return]
 
-        # album artist(s) - prefer canonical names from MusicBrainz when MB IDs are
-        # present, with a per-position fallback to the tag-parsed name for any MBID
-        # that fails to resolve.
+        # Album artists: use canonical MB names when MBIDs are present, with a
+        # per-position fallback to the tag-parsed name if a lookup fails.
         album_artists: UniqueList[Artist | ItemMapping] = UniqueList()
         mb_provider = cast("MusicbrainzProvider | None", self.mass.get_provider("musicbrainz"))
         resolved_album_artists: list[tuple[str, str | None, str | None]] = []
