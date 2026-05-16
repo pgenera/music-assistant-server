@@ -374,10 +374,56 @@ class RcpClient:
         await self._send_command("Stop")
         self.transport_state = "stop"
 
-    async def play_url(self, url: str) -> None:
-        """Push a stream URL to the device and start playing."""
-        await self._send_command(f"PlayStation {url}")
+    async def play_url(
+        self,
+        url: str,
+        title: str = "",
+        artist: str = "",
+        fmt: str = "WAV",
+    ) -> None:
+        """Push a stream URL to the device and start playing.
+
+        Uses the documented working-song flow rather than the undocumented
+        PlayStation command. Setting `format` explicitly avoids the
+        SoundBridge's content-type probing, which is unreliable for
+        chunked-encoded WAV with no Content-Length. remoteStream=1 marks the
+        URL as an endless stream so the device does not loop on EOF.
+
+        All commands are pipelined into a single TCP send so the device can
+        process the whole sequence without per-command round-trips.
+        """
+        commands = [
+            "ClearWorkingSong",
+            f"SetWorkingSongInfo url {url}",
+            f"SetWorkingSongInfo format {fmt}",
+            "SetWorkingSongInfo remoteStream 1",
+        ]
+        if title:
+            commands.append(f"SetWorkingSongInfo title {title}")
+        if artist:
+            commands.append(f"SetWorkingSongInfo artist {artist}")
+        commands.append("QueueAndPlayOne working")
+        await self._send_pipeline(commands)
         self.transport_state = "play"
+
+    async def _send_pipeline(self, commands: list[str]) -> None:
+        """Send several commands as a single TCP write (no per-command waits)."""
+        if not self._connected and not self._closing:
+            await self.connect()
+        if not self._connected:
+            return
+        payload = "".join(f"{c}\r\n" for c in commands).encode()
+        async with self._lock:
+            try:
+                for c in commands:
+                    _LOGGER.debug("TX: %s", c)
+                self._writer.write(payload)
+                await self._writer.drain()
+            except (TimeoutError, OSError, asyncio.CancelledError) as err:
+                _LOGGER.debug("Pipeline send failed: %s", err)
+                self._handle_disconnect()
+                if isinstance(err, asyncio.CancelledError) and self._closing:
+                    raise
 
     async def set_volume(self, volume: int) -> None:
         """Set volume level (0–100)."""
@@ -414,3 +460,7 @@ class RcpClient:
         """Put the device into standby."""
         await self._send_command("SetPowerState standby")
         self.power_state = "standby"
+
+    async def set_working_song_info(self, field: str, value: str) -> None:
+        """Set a working song info field shown on the device display."""
+        await self._send_command(f"SetWorkingSongInfo {field} {value}")
