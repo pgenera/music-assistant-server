@@ -34,6 +34,7 @@ async def get_config_entries(
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
     """Return config entries for a SoundBridge provider instance."""
+    # ruff: noqa: ARG001
     return (
         ConfigEntry(
             key=CONF_HOST,

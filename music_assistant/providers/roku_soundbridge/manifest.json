@@ -5,5 +5,5 @@
   "description": "Player provider for Roku SoundBridge network music players using the RCP protocol.",
   "codeowners": ["@pgenera"],
   "requirements": [],
-  "documentation": "https://github.com/pgenera/ma-soundbridge"
+  "documentation": "https://music-assistant.io/player-support/roku-soundbridge/"
 }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from music_assistant.models.player_provider import PlayerProvider
 
 from .constants import CONF_HOST, CONF_NAME, CONF_PORT, DEFAULT_NAME, DEFAULT_PORT
@@ -13,9 +15,9 @@ class SoundBridgeProvider(PlayerProvider):
 
     async def discover_players(self) -> None:
         """Register the configured SoundBridge as a player."""
-        host: str = self.config.get_value(CONF_HOST)
-        port: int = int(self.config.get_value(CONF_PORT, DEFAULT_PORT))
-        name: str = self.config.get_value(CONF_NAME, DEFAULT_NAME)
+        host = cast("str", self.config.get_value(CONF_HOST))
+        port = int(cast("int | str", self.config.get_value(CONF_PORT, DEFAULT_PORT)))
+        name = cast("str", self.config.get_value(CONF_NAME, DEFAULT_NAME))
 
         player_id = f"soundbridge_{host.replace('.', '_').replace(':', '_')}"
         player = SoundBridgePlayer(

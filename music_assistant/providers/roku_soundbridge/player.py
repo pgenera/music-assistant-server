@@ -89,7 +89,7 @@ class SoundBridgePlayer(Player):
         self._attr_device_info.identifiers[IdentifierType.IP_ADDRESS] = host
 
     def _on_client_state_change(self) -> None:
-        """Called by RcpClient whenever device state changes."""
+        """Handle a state change notification from the RCP client."""
         self._sync_client_state()
         self.update_state()
 
@@ -111,9 +111,7 @@ class SoundBridgePlayer(Player):
                 time.time() - self._last_play_url_time < _PLAY_GRACE_SECONDS
             ):
                 transport = "buffering"
-            self._attr_playback_state = _TRANSPORT_TO_PLAYBACK.get(
-                transport, PlaybackState.IDLE
-            )
+            self._attr_playback_state = _TRANSPORT_TO_PLAYBACK.get(transport, PlaybackState.IDLE)
 
         self._attr_volume_level = client.volume
         self._attr_volume_muted = client.muted
@@ -212,7 +210,7 @@ class SoundBridgePlayer(Player):
         self.update_state()
 
     async def volume_set(self, volume_level: int) -> None:
-        """Set volume (0–100)."""
+        """Set volume (0-100)."""
         await self._client.set_volume(volume_level)
         self._attr_volume_level = volume_level
         self.update_state()
@@ -250,7 +248,9 @@ class SoundBridgePlayer(Player):
 
         url = await self.mass.streams.resolve_stream_url(self.player_id, media)
         ext = url.rsplit(".", 1)[-1].lower()
-        fmt = {"wav": "WAV", "mp3": "MP3", "aac": "AAC", "aif": "AIFF", "aiff": "AIFF"}.get(ext, "WAV")
+        fmt = {"wav": "WAV", "mp3": "MP3", "aac": "AAC", "aif": "AIFF", "aiff": "AIFF"}.get(
+            ext, "WAV"
+        )
 
         # When MA injects ICY metadata in-stream (MP3 mode), skip RCP metadata
         # pushes — the device parses ICY blocks and updates its own display.

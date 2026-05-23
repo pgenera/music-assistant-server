@@ -30,11 +30,11 @@ class RcpClient:
         self._connecting = False
         self._closing = False
         self._lock = asyncio.Lock()
-        self._pending_responses: dict[str, deque[asyncio.Future]] = {}
+        self._pending_responses: dict[str, deque[asyncio.Future[Any]]] = {}
 
-        self._read_task: asyncio.Task | None = None
-        self._poll_task: asyncio.Task | None = None
-        self._reconnect_task: asyncio.Task | None = None
+        self._read_task: asyncio.Task[None] | None = None
+        self._poll_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
 
         # Device state
         self.power_state = "on"
@@ -52,7 +52,7 @@ class RcpClient:
         self.mac_address = ""
         self.version = ""
 
-        self._list_future: asyncio.Future | None = None
+        self._list_future: asyncio.Future[list[str]] | None = None
         self._current_list: list[str] = []
 
     @property
@@ -65,27 +65,27 @@ class RcpClient:
         if self._connected:
             return True
         if self._connecting:
+            # Wait for the in-flight connect attempt to finish, then return its result.
             for _ in range(50):
-                if self._connected:
-                    return True
-                if not self._connecting:
-                    break
                 await asyncio.sleep(0.1)
-            if self._connected:
-                return True
+                if not self._connecting:
+                    break  # type: ignore[unreachable]
+            return self._connected
 
         self._connecting = True
         try:
             _LOGGER.debug("Connecting to %s:%d", self.host, self.port)
-            self._reader, self._writer = await asyncio.wait_for(
+            reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), timeout=5.0
             )
+            self._reader = reader
+            self._writer = writer
             self._connected = True
             self._closing = False
 
             line = b""
             for _ in range(3):
-                line = await asyncio.wait_for(self._reader.readline(), timeout=5.0)
+                line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                 if line.strip():
                     break
             if not line.startswith(b"roku: ready"):
@@ -182,16 +182,19 @@ class RcpClient:
             return None
 
         async with self._lock:
+            writer = self._writer
+            if writer is None:
+                return None
             command_name = command.split(None, 1)[0].lower()
-            future = None
+            future: asyncio.Future[Any] | None = None
             if wait_for_response:
                 future = asyncio.Future()
                 self._pending_responses.setdefault(command_name, deque()).append(future)
 
             try:
                 _LOGGER.debug("TX: %s", command)
-                self._writer.write(f"{command}\r\n".encode())
-                await self._writer.drain()
+                writer.write(f"{command}\r\n".encode())
+                await writer.drain()
                 if future:
                     return await asyncio.wait_for(future, timeout=5.0)
                 return "SENT"
@@ -210,9 +213,12 @@ class RcpClient:
 
     async def _read_loop(self) -> None:
         """Read lines from the device and dispatch to state parser."""
+        reader = self._reader
+        if reader is None:
+            return
         try:
             while self._connected:
-                line_bytes = await self._reader.readline()
+                line_bytes = await reader.readline()
                 if not line_bytes:
                     break
                 line = line_bytes.decode(errors="replace").strip()
@@ -414,11 +420,14 @@ class RcpClient:
             return
         payload = "".join(f"{c}\r\n" for c in commands).encode()
         async with self._lock:
+            writer = self._writer
+            if writer is None:
+                return
             try:
                 for c in commands:
                     _LOGGER.debug("TX: %s", c)
-                self._writer.write(payload)
-                await self._writer.drain()
+                writer.write(payload)
+                await writer.drain()
             except (TimeoutError, OSError, asyncio.CancelledError) as err:
                 _LOGGER.debug("Pipeline send failed: %s", err)
                 self._handle_disconnect()
@@ -426,7 +435,7 @@ class RcpClient:
                     raise
 
     async def set_volume(self, volume: int) -> None:
-        """Set volume level (0–100)."""
+        """Set volume level (0-100)."""
         await self._send_command(f"SetVolume {volume}")
         self.volume = volume
 
@@ -446,8 +455,8 @@ class RcpClient:
         :param timeout: Maximum seconds to wait.
         :returns: True if on within timeout.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
             result = await self._send_command(
                 "GetPowerState", wait_for_response=True, disconnect_on_error=False
             )
