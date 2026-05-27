@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import (
+    EventType,
     IdentifierType,
     PlaybackState,
     PlayerFeature,
     PlayerType,
 )
+from music_assistant_models.event import MassEvent
 from music_assistant_models.player import DeviceInfo, PlayerMedia
 
 from music_assistant.constants import (
@@ -70,6 +72,8 @@ class SoundBridgePlayer(Player):
         self._last_play_url_time: float = 0.0
         self._last_pushed_title: str = ""
         self._last_pushed_artist: str = ""
+        self._last_pushed_duration_ms: int = 0
+        self._unsub_queue_event = None
         # Set name before super().__init__ so PlayerState is built with the right name.
         # All other _attr_* assignments must come AFTER super().__init__ because
         # super().__init__ resets mutable _attr_* defaults (e.g. supported_features = set()).
@@ -124,12 +128,19 @@ class SoundBridgePlayer(Player):
         if self._attr_playback_state == PlaybackState.PLAYING:
             self._attr_elapsed_time = float(client.position)
             self._attr_elapsed_time_last_updated = client.position_updated_at or time.time()
+            # Prefer MA's queue current_item over RCP-polled title/artist —
+            # MA knows the new track title at the exact moment the queue
+            # advances, whereas RCP needs the ICY block to land on the device
+            # (~1-2s) plus the next poll cycle (~5s) before GetCurrentSongInfo
+            # surfaces it. Fall back to RCP only when there is no active queue
+            # (e.g. user kicks off playback from the device's IR remote).
+            queue_title, queue_artist, queue_duration = self._current_queue_track_metadata()
             self._attr_current_media = PlayerMedia(
                 uri=client.url or "",
-                title=client.title or None,
-                artist=client.artist or None,
+                title=queue_title or client.title or None,
+                artist=queue_artist or client.artist or None,
                 album=client.album or None,
-                duration=client.duration or None,
+                duration=queue_duration or client.duration or None,
             )
         else:
             self._attr_elapsed_time = None
@@ -155,7 +166,7 @@ class SoundBridgePlayer(Player):
         return 10 if self._attr_playback_state == PlaybackState.PLAYING else 30
 
     async def on_config_updated(self) -> None:
-        """Persist codec/ICY defaults and connect to the device.
+        """Persist codec/ICY defaults, subscribe to queue events, and connect.
 
         get_config_entries() overrides the display default to mp3/basic, but
         MA's streams controller reads with get_raw_player_config_value() which
@@ -170,11 +181,37 @@ class SoundBridgePlayer(Player):
         ):
             if self.mass.config.get_raw_player_config_value(self.player_id, key) is None:
                 self.mass.config.set_raw_player_config_value(self.player_id, key, default)
+
+        # Subscribe to queue events so we can push title/artist to the device
+        # the moment the queue advances, instead of waiting for the next poll
+        # cycle. Tied to this player_id so we only see events for our queue.
+        if self._unsub_queue_event is None:
+            self._unsub_queue_event = self.mass.subscribe(
+                self._on_queue_event,
+                event_filter=EventType.QUEUE_UPDATED,
+                id_filter=self.player_id,
+            )
+
         await self._client.connect()
 
     async def on_unload(self) -> None:
         """Disconnect the device when player is unloaded."""
+        if self._unsub_queue_event is not None:
+            self._unsub_queue_event()
+            self._unsub_queue_event = None
         await self._client.disconnect()
+
+    async def _on_queue_event(self, event: MassEvent) -> None:
+        """React to queue updates by pushing the new title/artist to the device.
+
+        MA fires QUEUE_UPDATED when the current item changes (track advance,
+        manual skip, etc.). Pushing via RCP here gives the device display
+        the new metadata immediately — far faster than waiting for the next
+        ICY block to land or the next poll cycle to run.
+        """
+        if self._attr_playback_state != PlaybackState.PLAYING:
+            return
+        await self._push_current_track_metadata()
 
     async def poll(self) -> None:
         """Refresh state from the client."""
@@ -183,14 +220,17 @@ class SoundBridgePlayer(Player):
         self.update_state()
 
     async def _push_current_track_metadata(self) -> None:
-        """Push the active queue item's title/artist to the device display."""
+        """Push the active queue item's title/artist to the device display.
+
+        Pushes via RCP SetWorkingSongInfo regardless of codec. For MP3
+        playback the device will also receive ICY in-stream metadata
+        eventually, but an explicit push at the moment of track change
+        is much faster than waiting for the buffer to drain to the new
+        ICY block.
+        """
         if self._attr_playback_state != PlaybackState.PLAYING:
             return
-        # When MP3+ICY is in use, the in-stream StreamTitle blocks update the
-        # display; sending RCP metadata at the same time fights with that.
-        if (self._client.url or "").rsplit(".", 1)[-1].lower() == "mp3":
-            return
-        title, artist = self._current_queue_track_metadata()
+        title, artist, duration_seconds = self._current_queue_track_metadata()
 
         if title and title != self._last_pushed_title:
             await self._client.set_working_song_info("title", title)
@@ -198,6 +238,11 @@ class SoundBridgePlayer(Player):
         if artist and artist != self._last_pushed_artist:
             await self._client.set_working_song_info("artist", artist)
             self._last_pushed_artist = artist
+        if duration_seconds:
+            duration_ms = int(duration_seconds * 1000)
+            if duration_ms != self._last_pushed_duration_ms:
+                await self._client.set_working_song_info("trackLength", str(duration_ms))
+                self._last_pushed_duration_ms = duration_ms
 
     async def power(self, powered: bool) -> None:
         """Handle power on/off — wakes from standby or puts device into standby."""
@@ -252,27 +297,40 @@ class SoundBridgePlayer(Player):
             ext, "WAV"
         )
 
-        # When MA injects ICY metadata in-stream (MP3 mode), skip RCP metadata
-        # pushes — the device parses ICY blocks and updates its own display.
+        # When MA injects ICY metadata in-stream (MP3 mode), skip the title/
+        # artist RCP push — the device parses ICY blocks and updates the
+        # display itself. We always push trackLength though: ICY doesn't
+        # carry duration, so without it the device has no total-time to show.
         skip_rcp_meta = fmt == "MP3"
-        title, artist = ("", "") if skip_rcp_meta else self._current_queue_track_metadata()
+        queue_title, queue_artist, queue_duration = self._current_queue_track_metadata()
+        title, artist = ("", "") if skip_rcp_meta else (queue_title, queue_artist)
+        length_ms = int(queue_duration * 1000) if queue_duration else None
 
         self._last_play_url_time = time.time()
         self._last_pushed_title = title
         self._last_pushed_artist = artist
-        await self._client.play_url(url, title=title, artist=artist, fmt=fmt)
+        self._last_pushed_duration_ms = length_ms or 0
+        await self._client.play_url(
+            url, title=title, artist=artist, fmt=fmt, length_ms=length_ms
+        )
         self._attr_playback_state = PlaybackState.PLAYING
         self._attr_current_media = media
         self.update_state()
 
-    def _current_queue_track_metadata(self) -> tuple[str, str]:
-        """Return (title, artist) of the active queue's current item, or empty strings."""
+    def _current_queue_track_metadata(self) -> tuple[str, str, int | None]:
+        """Return (title, artist, duration_seconds) of the active queue's current item.
+
+        Title and artist are empty strings when not available. Duration is
+        None when the queue item doesn't carry a known length (e.g. a live
+        stream queued from outside MA).
+        """
         queue = self.mass.player_queues.get_active_queue(self.player_id)
         if not queue or not queue.current_item:
-            return "", ""
+            return "", "", None
         item = queue.current_item
         media_item = item.media_item
         title = (media_item.name if media_item else None) or item.name or ""
         artists = getattr(media_item, "artists", None) if media_item else None
         artist = " / ".join(a.name for a in artists) if artists else ""
-        return title, artist
+        duration = item.duration if item.duration else None
+        return title, artist, duration

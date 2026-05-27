@@ -386,6 +386,7 @@ class RcpClient:
         title: str = "",
         artist: str = "",
         fmt: str = "WAV",
+        length_ms: int | None = None,
     ) -> None:
         """Push a stream URL to the device and start playing.
 
@@ -394,6 +395,11 @@ class RcpClient:
         SoundBridge's content-type probing, which is unreliable for
         chunked-encoded WAV with no Content-Length. remoteStream=1 marks the
         URL as an endless stream so the device does not loop on EOF.
+
+        :param length_ms: Track length in milliseconds, if known. Pushed via
+            ``SetWorkingSongInfo trackLength`` so the device can show a
+            total-time / progress bar — WAV/PCM streams have no inherent
+            length, so without this the display says nothing about duration.
 
         All commands are pipelined into a single TCP send so the device can
         process the whole sequence without per-command round-trips.
@@ -408,6 +414,8 @@ class RcpClient:
             commands.append(f"SetWorkingSongInfo title {title}")
         if artist:
             commands.append(f"SetWorkingSongInfo artist {artist}")
+        if length_ms is not None and length_ms > 0:
+            commands.append(f"SetWorkingSongInfo trackLength {length_ms}")
         commands.append("QueueAndPlayOne working")
         await self._send_pipeline(commands)
         self.transport_state = "play"
