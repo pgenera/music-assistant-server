@@ -321,8 +321,13 @@ class SoundBridgePlayer(Player):
         """Return (title, artist, duration_seconds) of the active queue's current item.
 
         Title and artist are empty strings when not available. Duration is
-        None when the queue item doesn't carry a known length (e.g. a live
-        stream queued from outside MA).
+        None when:
+          - the queue item doesn't carry a known length (e.g. a live stream
+            queued from outside MA), OR
+          - the queue has more than one item (in flow mode the SoundBridge
+            sees the whole queue as one continuous song, so the per-track
+            trackLength we'd push is wrong after the first track — better
+            to show no total than a stale one).
         """
         queue = self.mass.player_queues.get_active_queue(self.player_id)
         if not queue or not queue.current_item:
@@ -332,5 +337,8 @@ class SoundBridgePlayer(Player):
         title = (media_item.name if media_item else None) or item.name or ""
         artists = getattr(media_item, "artists", None) if media_item else None
         artist = " / ".join(a.name for a in artists) if artists else ""
-        duration = item.duration if item.duration else None
+        # Only expose a duration when there's exactly one track in the queue.
+        # The flow stream's trackLength gets locked at QueueAndPlayOne time
+        # and the device ignores updates to it; better to skip than mislead.
+        duration = item.duration if (item.duration and queue.items == 1) else None
         return title, artist, duration
