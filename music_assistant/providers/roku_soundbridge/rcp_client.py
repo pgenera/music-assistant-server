@@ -202,7 +202,7 @@ class RcpClient:
 
     async def turn_on(self) -> None:
         """Wake the device from standby."""
-        await self._send_command("PlayPreset 0")
+        await self._send_command("SetPowerState on yes")
         self.power_state = "on"
 
     async def wait_for_power_on(self, timeout: float = 5.0) -> bool:

@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from typing import Any
 
 import pytest
 import websockets
+
+_LOGGER = logging.getLogger(__name__)
 
 MA_TOKEN = os.environ.get("MA_TOKEN", "")
 MA_HOST = os.environ.get("MA_HOST", "localhost")
@@ -63,14 +66,20 @@ async def _rcp_query(
 async def _await_stop(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-) -> None:
-    """Send Stop and poll GetTransportState until Stopped."""
+) -> str:
+    """Ensure the device is idle and return ``"standby"`` or ``"stop"``."""
+    state = await _rcp_query(reader, writer, "GetTransportState")
+    if "Standby" in state:
+        return "standby"
     await _rcp_query(reader, writer, "Stop")
     for _ in range(30):
-        if "Stop" in await _rcp_query(reader, writer, "GetTransportState"):
-            return
+        state = await _rcp_query(reader, writer, "GetTransportState")
+        if "Standby" in state:
+            return "standby"
+        if "Stop" in state:
+            return "stop"
         await asyncio.sleep(0.1)
-    msg = "device did not reach Stop within 3s"
+    msg = f"device did not reach Stop/Standby within 3s (last={state!r})"
     raise AssertionError(msg)
 
 
@@ -109,9 +118,10 @@ async def _wait_for_audio(
     seen_reset = False
     while time.monotonic() - t0 < timeout:
         elapsed = await _rcp_query(reader, writer, "GetElapsedTime")
-        if "0:00:00" in elapsed:
+        val = elapsed.partition(":")[2].strip()
+        if val == "0:00:00":
             seen_reset = True
-        elif seen_reset:
+        elif seen_reset and ":" in val and "error" not in val.lower():
             return time.monotonic() - t0
         await asyncio.sleep(0.05)
     msg = f"elapsed never advanced past 0 within {timeout}s"
@@ -139,21 +149,45 @@ async def test_player_registered() -> None:
     assert player["available"], f"player not available: {player}"
 
 
+async def _pick_playable_track(client: WSClient) -> dict[str, Any]:
+    """Return a playable library track, preferring local filesystem items."""
+    prov_res = await client.call("providers")
+    loaded_instances = {
+        p["instance_id"] for p in (prov_res.get("result") or []) if p.get("available", True)
+    }
+    fallback: dict[str, Any] | None = None
+    for command in ("music/recently_added_tracks", "music/tracks/library_items"):
+        res = await client.call(command, {"limit": 25})
+        for track in res.get("result") or []:
+            usable = [
+                m
+                for m in (track.get("provider_mappings") or [])
+                if m.get("available", True)
+                and (not loaded_instances or m.get("provider_instance") in loaded_instances)
+            ]
+            if any(str(m.get("provider_domain", "")).startswith("filesystem_") for m in usable):
+                return dict(track)
+            if usable and fallback is None:
+                fallback = dict(track)
+    if fallback is not None:
+        return fallback
+    msg = "no playable tracks available on any loaded provider"
+    raise AssertionError(msg)
+
+
 async def test_e2e_play_a_track() -> None:
     """Play a real recently-added track and verify audio start and ICY metadata."""
     client = await _connect_ws()
 
-    res = await client.call("music/recently_added_tracks", {"limit": 1})
-    tracks = res.get("result", [])
-    assert tracks, "no recently-added tracks available to test with"
-    track = tracks[0]
+    track = await _pick_playable_track(client)
     expected_title = track["name"]
     expected_artist = (track.get("artists") or [{}])[0].get("name", "")
 
     rcp_r, rcp_w = await asyncio.open_connection(RCP_HOST, RCP_PORT)
+    was_standby = False
     try:
         await asyncio.wait_for(rcp_r.readline(), timeout=2)
-        await _await_stop(rcp_r, rcp_w)
+        was_standby = (await _await_stop(rcp_r, rcp_w)) == "standby"
 
         t0 = time.monotonic()
         watcher = asyncio.create_task(_wait_for_audio(rcp_r, rcp_w, t0, AUDIO_BUDGET_S + 2))
@@ -163,6 +197,12 @@ async def test_e2e_play_a_track() -> None:
         )
         assert play.get("error_code") is None, play
         audio_at = await watcher
+        _LOGGER.info(
+            "Audio started at %.2fs (was_standby=%s, title=%r)",
+            audio_at,
+            was_standby,
+            expected_title,
+        )
         assert audio_at <= AUDIO_BUDGET_S, f"audio took {audio_at:.2f}s"
 
         info = await _poll_song_info_for(rcp_r, rcp_w, expected_title, timeout=8.0)
@@ -174,6 +214,8 @@ async def test_e2e_play_a_track() -> None:
     finally:
         try:
             rcp_w.write(b"Stop\r\n")
+            if was_standby:
+                rcp_w.write(b"SetPowerState standby\r\n")
             await rcp_w.drain()
         finally:
             rcp_w.close()

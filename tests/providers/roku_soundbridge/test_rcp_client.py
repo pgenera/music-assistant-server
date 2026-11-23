@@ -93,9 +93,9 @@ class FakeRcpServer:
         }
         if lower in canned:
             lines = canned[lower]
-        elif lower == "playpreset 0":
+        elif lower == "setpowerstate on yes":
             self.power_state = "on"
-            lines = ["PlayPreset: OK"]
+            lines = ["SetPowerState: OK"]
         elif lower == "setpowerstate standby":
             self.power_state = "standby"
             lines = ["SetPowerState: OK"]
@@ -228,6 +228,7 @@ async def test_standby_wake_and_volume_controls(rcp_server: FakeRcpServer) -> No
                 break
             await asyncio.sleep(0.05)
 
+        assert "SetPowerState on yes" in rcp_server.received_commands
         assert "SetVolume 62" in rcp_server.received_commands
         assert "Mute on" in rcp_server.received_commands
         assert "SetPowerState standby" in rcp_server.received_commands
