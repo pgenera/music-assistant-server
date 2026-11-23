@@ -1,0 +1,13 @@
+{
+  "type": "player",
+  "domain": "roku_soundbridge",
+  "stage": "beta",
+  "name": "Roku SoundBridge",
+  "description": "Stream music to Roku and Pinnacle SoundBridge network music players over the RCP protocol.",
+  "codeowners": ["@pgenera"],
+  "requirements": [],
+  "documentation": "https://github.com/pgenera/ma-roku-soundbridge#readme",
+  "multi_instance": false,
+  "builtin": false,
+  "mdns_discovery": ["_roku-rcp._tcp.local."]
+}

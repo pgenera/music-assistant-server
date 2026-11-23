@@ -1,0 +1,11 @@
+{
+  "config_entries": {
+    "manual_discovery_ip_addresses": {
+      "label": "Manual SoundBridge Hosts",
+      "description": "Optional list of SoundBridge devices to connect to when mDNS discovery is unavailable (for example across VLANs). Enter one host per line as host or host:port (default RCP port is 5555)."
+    }
+  },
+  "manifest": {
+    "description": "Stream music to Roku and Pinnacle SoundBridge network music players over the RCP protocol."
+  }
+}
